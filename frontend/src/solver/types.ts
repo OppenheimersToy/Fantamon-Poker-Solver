@@ -39,9 +39,6 @@ export type CalculateResponse = {
   recommendation: RecommendedMove;
 };
 
-/** 0-based cell key `x,y` → how often that cell was part of the optimal move (Keep One target or Keep Both endpoint). */
-export type CellVoteMap = Record<string, number>;
-
 /** Result of multiple shuffled-deck samples (Monte Carlo over unknown pile order). */
 export type AveragedSolverResult = {
   /** Samples per cascade attempt (fresh shuffles each attempt). */
@@ -63,9 +60,6 @@ export type AveragedSolverResult = {
   trusted: boolean;
   winnerVotes: number;
   secondVotes: number;
-  cellVotes: CellVoteMap;
-  keepBothSkillVotes: number;
-  discardSkillVotes: number;
 };
 
 /** Live Monte Carlo tick from the Wasm solver (human 1-based cell coords). */

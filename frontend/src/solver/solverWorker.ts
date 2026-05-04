@@ -71,30 +71,8 @@ async function getWasm() {
   return wasmReady;
 }
 
-function tallyRecommendation(
-  r: RecommendedMove,
-  cellVotes: Record<string, number>,
-  skillTally: { keepBoth: number; discard: number },
-) {
-  if (r.type === "KeepOne") {
-    const k = `${r.column - 1},${r.row - 1}`;
-    cellVotes[k] = (cellVotes[k] ?? 0) + 1;
-  } else if (r.type === "KeepBoth") {
-    skillTally.keepBoth += 1;
-    const a = `${r.first.column - 1},${r.first.row - 1}`;
-    const b = `${r.second.column - 1},${r.second.row - 1}`;
-    cellVotes[a] = (cellVotes[a] ?? 0) + 1;
-    cellVotes[b] = (cellVotes[b] ?? 0) + 1;
-  } else {
-    skillTally.discard += 1;
-  }
-}
-
 type BatchAgg = {
   sampleCount: number;
-  cellVotes: Record<string, number>;
-  keepBothSkillVotes: number;
-  discardSkillVotes: number;
   winnerVotes: number;
   secondVotes: number;
   consensus: RecommendedMove;
@@ -114,8 +92,6 @@ function runOneBatch(
   progressOffset: number,
   progressTotal: number,
 ): BatchAgg {
-  const cellVotes: Record<string, number> = {};
-  const skillTally = { keepBoth: 0, discard: 0 };
   const byKey = new Map<string, { count: number; recommendation: RecommendedMove }>();
   let sumEv = 0;
 
@@ -136,7 +112,6 @@ function runOneBatch(
     const prev = byKey.get(key);
     if (prev) prev.count += 1;
     else byKey.set(key, { count: 1, recommendation: r });
-    tallyRecommendation(r, cellVotes, skillTally);
     const prog: WorkResponse = {
       id,
       type: "solver_averaged_progress",
@@ -163,9 +138,6 @@ function runOneBatch(
 
   return {
     sampleCount,
-    cellVotes,
-    keepBothSkillVotes: skillTally.keepBoth,
-    discardSkillVotes: skillTally.discard,
     winnerVotes,
     secondVotes,
     consensus,
@@ -235,9 +207,6 @@ function runAveraged(wasm: WasmModule, data: WorkRequestAveraged, id: string): A
     trusted,
     winnerVotes: b.winnerVotes,
     secondVotes: b.secondVotes,
-    cellVotes: b.cellVotes,
-    keepBothSkillVotes: b.keepBothSkillVotes,
-    discardSkillVotes: b.discardSkillVotes,
   };
 }
 
