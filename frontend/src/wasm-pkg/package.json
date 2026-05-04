@@ -1,0 +1,15 @@
+{
+  "name": "fantamon_solver",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "fantamon_solver_bg.wasm",
+    "fantamon_solver.js",
+    "fantamon_solver.d.ts"
+  ],
+  "main": "fantamon_solver.js",
+  "types": "fantamon_solver.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "fantamon-optimal-move-calculator",
+  "private": true,
+  "workspaces": ["frontend"]
+}
+

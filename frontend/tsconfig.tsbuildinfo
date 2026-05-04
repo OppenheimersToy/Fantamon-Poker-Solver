@@ -1,0 +1,1 @@
+{"root":["./src/main.tsx","./src/wasm-pkg.d.ts","./src/solver/deck.ts","./src/solver/rules.ts","./src/solver/solverworker.ts","./src/solver/types.ts","./src/solver/wasm-pkg.d.ts","./src/ui/app.tsx","./src/ui/cards.ts","./src/wasm-pkg/fantamon_solver.d.ts","./src/wasm-pkg/fantamon_solver_bg.wasm.d.ts"],"version":"5.9.3"}
