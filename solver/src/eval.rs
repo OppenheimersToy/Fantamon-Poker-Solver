@@ -220,18 +220,315 @@ pub fn best_hand_score_with_jokers(cards: &[Card; 5]) -> u32 {
     best
 }
 
-pub fn board_score(board_rows_cols: &[[Option<Card>; 5]; 10]) -> u32 {
-    let mut total = 0u32;
-    for line in board_rows_cols.iter() {
-        if line.iter().any(|c| c.is_none()) {
-            continue; // incomplete hand scores 0 for now
+// -----------------------------------------------------------------------------
+// Heuristic evaluation for *incomplete* lines (open board / mid-game gradient).
+// -----------------------------------------------------------------------------
+
+/// Wheel straight uses Ace low: A-2-3-4-5 (ranks 14,2,3,4,5).
+const WHEEL_RANKS: [u8; 5] = [14, 2, 3, 4, 5];
+
+/// Baseline weights (tunable): SF dominates, then flush draws, straight draws, rank texture.
+const WEIGHT_SF_4: f64 = 8.0;
+const WEIGHT_SF_3: f64 = 3.0;
+const WEIGHT_FLUSH_4: f64 = 2.0;
+const WEIGHT_FLUSH_3: f64 = 0.5;
+const WEIGHT_STRAIGHT_4: f64 = 3.5;
+const WEIGHT_STRAIGHT_3: f64 = 1.0;
+const WEIGHT_PAIR_OPEN: f64 = 1.0;
+
+/// Collect per-line statistics used by the heuristic: rank counts (non-joker cards only),
+/// empty cells, and joker cells. Jokers and empties both count as “flex” that can be assigned
+/// to maximize *potential* when scoring an incomplete line.
+#[derive(Debug, Clone, Copy)]
+struct LineMaterial {
+    /// `counts[r]` = number of fixed non-joker cards showing rank r (2..=14).
+    rank_counts: [u8; 15],
+    empty: usize,
+    jokers: usize,
+    /// Suits of fixed non-joker cards (may be empty if only wilds / empty slots).
+    fixed_suits: [Suit; 5],
+    fixed_suit_len: u8,
+}
+
+fn line_material(line: &[Option<Card>; 5]) -> LineMaterial {
+    let mut rank_counts = [0u8; 15];
+    let mut empty = 0usize;
+    let mut jokers = 0usize;
+    let mut fixed_suits = [Suit::Earth; 5];
+    let mut fixed_suit_len: u8 = 0;
+    for slot in line {
+        match slot {
+            None => empty += 1,
+            Some(c) if c.is_joker() => jokers += 1,
+            Some(c) => {
+                let r = rank_to_u8(c.rank);
+                if (2..=14).contains(&r) {
+                    rank_counts[r as usize] = rank_counts[r as usize].saturating_add(1);
+                }
+                if fixed_suit_len < 5 {
+                    fixed_suits[fixed_suit_len as usize] = c.suit;
+                    fixed_suit_len += 1;
+                }
+            }
         }
-        let mut hand = [Card { suit: Suit::Joker, rank: Rank::Joker }; 5];
+    }
+    LineMaterial {
+        rank_counts,
+        empty,
+        jokers,
+        fixed_suits,
+        fixed_suit_len,
+    }
+}
+
+#[inline]
+fn flex_slots(m: &LineMaterial) -> usize {
+    m.empty + m.jokers
+}
+
+/// Returns `None` if two or more **non-joker** suits appear among fixed cards — then no flush
+/// or straight-flush is possible, because those suits cannot all match.
+///
+/// When there are no concrete suited cards yet, returns a **dummy** anchor suit: flush length is
+/// then driven entirely by `flex_slots` (every empty/joker can agree on that suit).
+fn flush_agreement(m: &LineMaterial) -> Option<Suit> {
+    if m.fixed_suit_len == 0 {
+        return Some(Suit::Earth);
+    }
+    let mut seen: Option<Suit> = None;
+    for i in 0..(m.fixed_suit_len as usize) {
+        let s = m.fixed_suits[i];
+        match seen {
+            None => seen = Some(s),
+            Some(t) if t != s => return None,
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// Maximum number of cards that can share one suit, assuming jokers/empty adopt that suit.
+/// If flush is impossible (`None`), returns 0.
+fn max_flush_length(m: &LineMaterial) -> usize {
+    let Some(target) = flush_agreement(m) else {
+        return 0;
+    };
+    let fixed_in_suit = (0..(m.fixed_suit_len as usize))
+        .filter(|&i| m.fixed_suits[i] == target)
+        .count();
+    // Any joker or empty can become `target` without contradicting fixed cards (we already
+    // verified all fixed non-jokers share one suit when `Some`).
+    fixed_in_suit + flex_slots(m)
+}
+
+/// True if **fixed non-joker ranks** contain a duplicate — a straight needs five distinct ranks,
+/// so two concrete cards sharing a rank make a straight (and straight flush) impossible.
+fn straight_rank_blocked(counts: &[u8; 15]) -> bool {
+    (2..=14).any(|r| counts[r] > 1)
+}
+
+/// Enumerate the 10 rank windows for a 5-card straight: wheel + low=2..=10.
+fn straight_windows() -> [[u8; 5]; 10] {
+    let mut w = [[0u8; 5]; 10];
+    w[0] = WHEEL_RANKS;
+    let mut idx = 1;
+    for low in 2u8..=10 {
+        w[idx] = [low, low + 1, low + 2, low + 3, low + 4];
+        idx += 1;
+    }
+    w
+}
+
+/// Best “open straight” potential: we assume flex ranks are chosen to fit **some** window.
+/// Returns `(matched_fixed_ranks, wild_needed_min)` for the best feasible window; if no window
+/// works, returns `(0, usize::MAX)`.
+fn best_straight_window(counts: &[u8; 15], wild: usize) -> (usize, usize) {
+    if straight_rank_blocked(counts) {
+        return (0, usize::MAX);
+    }
+    // Fixed ranks that exist must all lie inside the chosen window; otherwise that window is dead.
+    let mut best_matched = 0usize;
+    let mut best_need = usize::MAX;
+    'win: for window in straight_windows() {
+        for r in 2..=14 {
+            if counts[r] > 0 && !window.contains(&(r as u8)) {
+                continue 'win;
+            }
+        }
+        for &wr in &window {
+            if counts[wr as usize] > 1 {
+                continue 'win;
+            }
+        }
+        let mut need = 0usize;
+        let mut matched = 0usize;
+        for &wr in &window {
+            if counts[wr as usize] == 1 {
+                matched += 1;
+            } else {
+                need += 1;
+            }
+        }
+        if need <= wild {
+            if matched > best_matched || (matched == best_matched && need < best_need) {
+                best_matched = matched;
+                best_need = need;
+            }
+        }
+    }
+    (best_matched, best_need)
+}
+
+/// Straight-flush potential uses the **intersection** of flush length and straight coverage:
+/// you need both same suit and a coherent straight window.
+fn straight_flush_heuristic(m: &LineMaterial) -> f64 {
+    if flush_agreement(m).is_none() {
+        return 0.0;
+    }
+    if straight_rank_blocked(&m.rank_counts) {
+        return 0.0;
+    }
+    let flush_len = max_flush_length(m);
+    let wild = flex_slots(m);
+    let (matched, need) = best_straight_window(&m.rank_counts, wild);
+    if need == usize::MAX {
+        return 0.0;
+    }
+    // Effective progress toward SF is limited by both dimensions.
+    let sf_span = flush_len.min(matched + need);
+    match sf_span {
+        5 => WEIGHT_SF_4 + 1.0, // nearly locked — bonus under complete-hand scale
+        4 => WEIGHT_SF_4,
+        3 => WEIGHT_SF_3,
+        2 => 0.4,
+        _ => 0.0,
+    }
+}
+
+fn flush_draw_heuristic(m: &LineMaterial) -> f64 {
+    let len = max_flush_length(m);
+    match len {
+        5 => WEIGHT_FLUSH_4 + 0.5,
+        4 => WEIGHT_FLUSH_4,
+        3 => WEIGHT_FLUSH_3,
+        2 => 0.12,
+        _ => 0.0,
+    }
+}
+
+fn straight_draw_heuristic(m: &LineMaterial, wild: usize) -> f64 {
+    if straight_rank_blocked(&m.rank_counts) {
+        return 0.0;
+    }
+    let (matched, need) = best_straight_window(&m.rank_counts, wild);
+    if need == usize::MAX {
+        return 0.0;
+    }
+    match (matched, need) {
+        (4, 1) => WEIGHT_STRAIGHT_4,
+        (3, 2) => WEIGHT_STRAIGHT_3,
+        (2, _) => 0.25,
+        _ => 0.08,
+    }
+}
+
+/// Cluster / pair potential: flex can pile onto one rank (trips, full house, quads in spirit).
+/// Magnitudes are kept near the user-requested scale (e.g. pair + several empties ≈ 1.0).
+fn rank_cluster_heuristic(m: &LineMaterial, wild: usize) -> f64 {
+    let mut best = 0.0f64;
+    for r in 2..=14 {
+        let base = m.rank_counts[r] as usize;
+        let pile = base + wild;
+        if pile >= 5 {
+            best = best.max(1.35);
+        } else if pile >= 4 {
+            best = best.max(1.15);
+        } else if pile >= 3 {
+            best = best.max(0.75);
+        } else if pile >= 2 {
+            // Pair with flex → strong texture; pair with no flex is mostly dead for expansion.
+            let v = if wild > 0 {
+                WEIGHT_PAIR_OPEN
+            } else {
+                0.28
+            };
+            best = best.max(v);
+        }
+    }
+    best
+}
+
+/// Heuristic value for one row/column of 5 slots (mix of [`Some(card)`], jokers, and empty).
+///
+/// - **Complete line:** returns the real poker score [`best_hand_score_with_jokers`] as `f64`
+///   so board totals stay comparable to the discrete scoring function at terminal states.
+/// - **Incomplete line:** estimates *potential*:
+///   - **Blocked flush / SF:** two concrete suits → no flush or SF points.
+///   - **Blocked straight / SF:** duplicate concrete rank → no straight or SF points.
+///   - **Jokers & empties:** treated as flexible “wild material” that can be assigned to maximize
+///     flush length, straight window fit, or rank clustering (same spirit as joker search in
+///     [`best_hand_score_with_jokers`], but much cheaper).
+///
+/// The numeric weights are intentionally modest versus finished-hand points (0–30 per line) so
+/// rollouts still emphasize actually completing hands as the game resolves.
+pub fn evaluate_partial_line(line: &[Option<Card>; 5]) -> f64 {
+    if line.iter().all(|s| s.is_some()) {
+        let mut hand = [Card {
+            suit: Suit::Joker,
+            rank: Rank::Joker,
+        }; 5];
         for i in 0..5 {
             hand[i] = line[i].unwrap();
         }
-        total += best_hand_score_with_jokers(&hand);
+        return best_hand_score_with_jokers(&hand) as f64;
     }
-    total
+
+    let mat = line_material(line);
+    let no_concrete_rank = (2..=14).all(|r| mat.rank_counts[r] == 0);
+    if mat.fixed_suit_len == 0 && no_concrete_rank {
+        // Only empty slots and/or jokers: huge flexibility, but no directional “draw” yet — keep
+        // this below a concrete 4-card flush draw so wired shapes win over a blank pipeline.
+        return 2.2 + 0.12 * (mat.jokers as f64) + 0.04 * (mat.empty as f64);
+    }
+
+    let wild = flex_slots(&mat);
+    let sf = straight_flush_heuristic(&mat);
+
+    // If SF is strongly alive, it subsumes separate flush/straight components to avoid double pay.
+    let (flush_h, straight_h) = if sf >= WEIGHT_SF_3 {
+        (0.0, 0.0)
+    } else {
+        (
+            flush_draw_heuristic(&mat),
+            straight_draw_heuristic(&mat, wild),
+        )
+    };
+
+    let rank_h = rank_cluster_heuristic(&mat, wild);
+
+    // Combine: dominant structure + smaller additive texture (pair progress still matters on SF paths).
+    let mut score = sf;
+    if sf < 1.0 {
+        // When no SF pressure, keep both draws (they are mutually exclusive structurally but both “open”).
+        score += 0.55 * flush_h + 0.45 * straight_h;
+    } else {
+        score += 0.15 * rank_h;
+    }
+    if sf < WEIGHT_SF_3 {
+        score += 0.35 * rank_h;
+    } else {
+        score += 0.1 * rank_h;
+    }
+
+    score
+}
+
+/// Sums [`evaluate_partial_line`] for all **10** lines (5 rows + 5 columns). This is the static
+/// evaluator used inside Monte Carlo playouts and whenever a mid-game board value is needed.
+pub fn board_total_value(board_rows_cols: &[[Option<Card>; 5]; 10]) -> f64 {
+    board_rows_cols
+        .iter()
+        .map(|line| evaluate_partial_line(line))
+        .sum()
 }
 

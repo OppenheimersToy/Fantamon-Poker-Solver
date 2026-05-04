@@ -39,6 +39,35 @@ export type CalculateResponse = {
   recommendation: RecommendedMove;
 };
 
+/** 0-based cell key `x,y` → how often that cell was part of the optimal move (Keep One target or Keep Both endpoint). */
+export type CellVoteMap = Record<string, number>;
+
+/** Result of multiple shuffled-deck samples (Monte Carlo over unknown pile order). */
+export type AveragedSolverResult = {
+  /** Samples per cascade attempt (fresh shuffles each attempt). */
+  sampleCount: number;
+  /**
+   * Agreement bar that was satisfied: `5` = first pass (strictly &gt;4 agrees), `3` = second pass,
+   * `2` = third pass, `0` = none (still show plurality consensus).
+   */
+  trustThresholdMet: number;
+  /** 1 = met &gt;4 (≥5), 2 = met ≥3 on 2nd batch, 3 = met ≥2 on 3rd batch, 0 = no bar met. */
+  trustTier: 0 | 1 | 2 | 3;
+  /** How many full batches ran (1–3). */
+  cascadeRoundsUsed: number;
+  /** Mean EV across the batch used for this result (one batch = `sampleCount` shuffles). */
+  meanEv: number;
+  /** Plurality winner (highest vote count among exact recommendations) for that batch. */
+  consensus: RecommendedMove;
+  /** True iff `trustTier` &gt; 0. */
+  trusted: boolean;
+  winnerVotes: number;
+  secondVotes: number;
+  cellVotes: CellVoteMap;
+  keepBothSkillVotes: number;
+  discardSkillVotes: number;
+};
+
 /** Live Monte Carlo tick from the Wasm solver (human 1-based cell coords). */
 export type SolverProgressPayload = {
   phase: string;

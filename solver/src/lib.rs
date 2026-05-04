@@ -13,8 +13,16 @@ pub struct CalculateRequest {
     pub current_deck: game::DeckState,
     pub drawn_cards: [game::Card; 2],
     pub remaining_skills: game::SkillsState,
-    /// Interpreted as number of Monte Carlo rollouts per candidate.
+    /// Number of UCT **iterations** (total MCTS simulations from the root).
     pub simulation_depth: u32,
+    /// How many **decision plies** to keep in the UCT tree (1 = no lookahead beyond playout;
+    /// typical 3–5 for a balance of quality and speed). Capped in the solver.
+    #[serde(default = "default_uct_max_depth")]
+    pub uct_max_depth: u8,
+}
+
+fn default_uct_max_depth() -> u8 {
+    solver::UCT_MAX_TREE_DEPTH
 }
 
 /// One-based cell coordinates: column 1–5 left→right, row 1–5 top→bottom (human-facing JSON).
@@ -132,6 +140,7 @@ pub fn calculate_optimal_move(
         drawn_cards,
         remaining_skills,
         simulation_depth,
+        uct_max_depth: solver::UCT_MAX_TREE_DEPTH,
     };
 
     let (ev, recommendation) = solver::calculate(req);
@@ -167,6 +176,7 @@ pub fn calculate_optimal_move_with_progress(
         drawn_cards,
         remaining_skills,
         simulation_depth,
+        uct_max_depth: solver::UCT_MAX_TREE_DEPTH,
     };
 
     let (ev, recommendation) = solver::calculate_with_progress(req, |sp| {

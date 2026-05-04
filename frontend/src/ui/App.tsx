@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
+  AveragedSolverResult,
   BoardState,
   Card,
   CalculateResponse,
@@ -19,9 +20,33 @@ function idx(x: number, y: number) {
 type WorkerMessage =
   | { id: string; type: "solver_progress"; payload: SolverProgressPayload }
   | { id: string; type: "solver_result"; result: CalculateResponse }
-  | { id: string; type: "solver_error"; error: string };
+  | { id: string; type: "solver_error"; error: string }
+  | { id: string; type: "solver_averaged_progress"; current: number; total: number }
+  | { id: string; type: "solver_averaged_result"; result: AveragedSolverResult };
 
 type ProgressPoint = { x: number; run: number; best: number; second: number };
+
+const AVG_SAMPLES = 10;
+
+/** Green (120°) = most votes among cells; red (0°) = least among cells with ≥1 vote. */
+function cellVoteHeatStyle(count: number, minP: number, maxP: number): React.CSSProperties | undefined {
+  if (count <= 0) return undefined;
+  const t = maxP <= minP ? 1 : (count - minP) / (maxP - minP);
+  const hue = 120 * t;
+  return { boxShadow: `inset 0 0 0 4px hsla(${hue}, 78%, 46%, 0.52)` };
+}
+
+/** Relative share vs the other skill recommendation count (DiscardBoth vs KeepBoth). */
+function skillVoteOutline(vThis: number, vOther: number): React.CSSProperties | undefined {
+  const tot = vThis + vOther;
+  if (vThis <= 0 || tot <= 0) return undefined;
+  const hue = 120 * (vThis / tot);
+  return {
+    outline: `3px solid hsla(${hue}, 78%, 50%, 0.72)`,
+    outlineOffset: 2,
+    borderRadius: 10,
+  };
+}
 
 const MAX_PROGRESS_POINTS = 4000;
 
@@ -139,10 +164,14 @@ export function App() {
   const [depth, setDepth] = useState(400);
 
   const [busy, setBusy] = useState(false);
+  /** True while the worker is running the 10× shuffled-deck averaged batch. */
+  const [averaging, setAveraging] = useState(false);
   const [calcDots, setCalcDots] = useState(1);
   const [calcNotice, setCalcNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<CalculateResponse | null>(null);
+  /** Shuffled-deck vote map; cleared when user clicks a cell or a shaded skill control. */
+  const [voteHeatmap, setVoteHeatmap] = useState<AveragedSolverResult | null>(null);
   const [progressSeries, setProgressSeries] = useState<ProgressPoint[]>([]);
   const [lastProgress, setLastProgress] = useState<SolverProgressPayload | null>(null);
   const [pendingPlacements, setPendingPlacements] = useState<Card[]>([]);
@@ -175,6 +204,13 @@ export function App() {
   const valid = useMemo(() => validPlacements(board), [board]);
   const validSet = useMemo(() => new Set(valid.map(([x, y]) => `${x},${y}`)), [valid]);
 
+  const voteCellRange = useMemo(() => {
+    if (!voteHeatmap) return null;
+    const vals = Object.values(voteHeatmap.cellVotes).filter((n) => n > 0);
+    if (vals.length === 0) return null;
+    return { min: Math.min(...vals), max: Math.max(...vals) };
+  }, [voteHeatmap]);
+
   const recoCells = useMemo(() => {
     const s = new Set<string>();
     const r = result?.recommendation;
@@ -196,6 +232,10 @@ export function App() {
       workerRef.current.onmessage = (ev: MessageEvent<WorkerMessage>) => {
         const msg = ev.data;
         if (msg.id !== String(reqIdRef.current)) return;
+        if (msg.type === "solver_averaged_progress") {
+          setCalcNotice(`Averaged solve: shuffle ${msg.current}/${msg.total} (up to 3 passes: >4, then ≥3, then ≥2 agrees)…`);
+          return;
+        }
         if (msg.type === "solver_progress") {
           const p = msg.payload;
           lastProgressRef.current = p;
@@ -215,8 +255,24 @@ export function App() {
           return;
         }
         setBusy(false);
+        setAveraging(false);
         if (msg.type === "solver_error") {
           setError(msg.error);
+          return;
+        }
+        if (msg.type === "solver_averaged_result") {
+          setError(null);
+          const r = msg.result;
+          setVoteHeatmap(r);
+          setResult({ ev: r.meanEv, recommendation: r.consensus });
+          const tierNote =
+            r.trustTier === 0
+              ? `no agreement bar met after ${r.cascadeRoundsUsed} pass(es) of ${r.sampleCount} shuffles each`
+              : `pass ${r.cascadeRoundsUsed}/3 — required ≥${r.trustThresholdMet} agreeing samples`;
+          const trust = r.trusted ? "Trusted:" : "Low agreement:";
+          setCalcNotice(
+            `${trust} ${tierNote}. Latest batch consensus ${r.winnerVotes}/${r.sampleCount}. Green cells = more often optimal; red = less. Click any cell or shaded skill to dismiss.`,
+          );
           return;
         }
         setError(null);
@@ -225,6 +281,7 @@ export function App() {
       };
       workerRef.current.onerror = () => {
         setBusy(false);
+        setAveraging(false);
         setError("Solver worker failed. Try again.");
       };
     }
@@ -245,6 +302,7 @@ export function App() {
     }
     reqIdRef.current += 1;
     setBusy(false);
+    setAveraging(false);
 
     if (canApplyBest) {
       setResult({
@@ -261,6 +319,7 @@ export function App() {
     setProgressSeries([]);
     lastProgressRef.current = null;
     setLastProgress(null);
+    setVoteHeatmap(null);
     setCalcNotice("Calculation cancelled.");
   }
 
@@ -286,6 +345,8 @@ export function App() {
   }, [busy]);
 
   function runSolverWithBoard(b: BoardState) {
+    setAveraging(false);
+    setVoteHeatmap(null);
     setCalcNotice(null);
     setError(null);
     setResult(null);
@@ -322,6 +383,35 @@ export function App() {
 
   function runSolver() {
     runSolverWithBoard(board);
+  }
+
+  function runSolverAveraged() {
+    setCalcNotice(null);
+    setError(null);
+    setResult(null);
+    setVoteHeatmap(null);
+    setProgressSeries([]);
+    lastProgressRef.current = null;
+    setLastProgress(null);
+    if (!drawn) {
+      setError(`Please enter two valid dealt cards. ${DEAL_CARD_FORMAT_HINT}`);
+      return;
+    }
+    const worker = ensureWorker();
+    reqIdRef.current += 1;
+    const id = String(reqIdRef.current);
+    setBusy(true);
+    setAveraging(true);
+    worker.postMessage({
+      id,
+      mode: "averaged" as const,
+      board,
+      drawn,
+      skills,
+      simulationDepth: depth,
+      excludedFromDraw,
+      sampleCount: AVG_SAMPLES,
+    });
   }
 
   function placeCardAt(x: number, y: number, c: Card) {
@@ -434,6 +524,11 @@ export function App() {
             const isValid = validSet.has(key);
             const isReco = recoCells.has(key);
             const isEditing = editing?.x === x && editing?.y === y;
+            const vCount = voteHeatmap?.cellVotes[key] ?? 0;
+            const heatStyle =
+              voteHeatmap && voteCellRange
+                ? cellVoteHeatStyle(vCount, voteCellRange.min, voteCellRange.max)
+                : undefined;
             let ghostDraft: { order?: "1st" | "2nd"; text: string } | null = null;
             if (!isEditing && !c && pendingPlacements.length > 0) {
               if (placementGhostMode === "sequential" && isValid) {
@@ -476,6 +571,7 @@ export function App() {
               <div
                 key={i}
                 className={cls}
+                style={heatStyle}
                 title={
                   pendingPlacements.length > 0
                     ? "Click to place the next card from the queue"
@@ -490,6 +586,10 @@ export function App() {
                             : "Not a legal empty cell yet"
                 }
                 onClick={(e) => {
+                  if (voteHeatmap) {
+                    setVoteHeatmap(null);
+                    return;
+                  }
                   if (e.altKey) {
                     if (c) {
                       openCellEditor(x, y);
@@ -675,7 +775,13 @@ export function App() {
         <button
           type="button"
           className="btn"
-          onClick={recordDiscardBothForCurrentDeal}
+          onClick={() => {
+            if (voteHeatmap) {
+              setVoteHeatmap(null);
+              return;
+            }
+            recordDiscardBothForCurrentDeal();
+          }}
           disabled={busy || !drawn || skills.discard_both <= 0}
         >
           Discard both (this deal) — use skill; both dealt cards go to this list and dealt fields clear
@@ -746,7 +852,20 @@ export function App() {
           </button>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          <label className="muted">
+          <label
+            className="muted"
+            style={
+              voteHeatmap
+                ? skillVoteOutline(voteHeatmap.keepBothSkillVotes, voteHeatmap.discardSkillVotes)
+                : undefined
+            }
+            onClick={(e) => {
+              if (voteHeatmap) {
+                e.preventDefault();
+                setVoteHeatmap(null);
+              }
+            }}
+          >
             Keep Both
             <input
               className="input"
@@ -758,7 +877,20 @@ export function App() {
               disabled={busy}
             />
           </label>
-          <label className="muted">
+          <label
+            className="muted"
+            style={
+              voteHeatmap
+                ? skillVoteOutline(voteHeatmap.discardSkillVotes, voteHeatmap.keepBothSkillVotes)
+                : undefined
+            }
+            onClick={(e) => {
+              if (voteHeatmap) {
+                e.preventDefault();
+                setVoteHeatmap(null);
+              }
+            }}
+          >
             Discard Both
             <input
               className="input"
@@ -798,7 +930,9 @@ export function App() {
             }}
           >
             <button className="btn primary" onClick={runSolver} disabled={busy}>
-              {busy ? `Calculating${".".repeat(calcDots)}` : "Calculate Optimal Move"}
+              {busy && !averaging
+                ? `Calculating${".".repeat(calcDots)}`
+                : "Calculate Optimal Move"}
             </button>
             {busy ? (
               <button type="button" className="btn" onClick={cancelCalculation}>
@@ -806,12 +940,24 @@ export function App() {
               </button>
             ) : null}
           </div>
+          <button className="btn" onClick={runSolverAveraged} disabled={busy}>
+            {busy && averaging
+              ? `Averaging ${AVG_SAMPLES} decks${".".repeat(calcDots)}`
+              : `Calculate Optimal Move Averaged (${AVG_SAMPLES} shuffles × up to 3 passes)`}
+          </button>
+          <div className="muted" style={{ fontSize: 12, lineHeight: 1.45, marginTop: -4 }}>
+            Pass 1: fresh {AVG_SAMPLES} shuffles — stop if the winning move has <strong>more than 4</strong>{" "}
+            votes (≥5). Else pass 2: another {AVG_SAMPLES} shuffles — stop if winner has ≥3 votes. Else pass
+            3: same with ≥2 votes. Heatmap shows only the last pass; green = most often optimal among those
+            samples; skill outlines compare Keep-both vs discard-both. Click a cell or outline to clear.
+          </div>
           <button
             className="btn"
             onClick={() => {
               setBoard(emptyBoard());
               setResult(null);
               setError(null);
+              setVoteHeatmap(null);
               setPendingPlacements([]);
               setPendingHint(null);
               setEditing(null);
@@ -849,6 +995,13 @@ export function App() {
               <div style={{ fontWeight: 800 }}>Recommended Move</div>
               <div style={{ fontVariantNumeric: "tabular-nums" }}>EV: {result.ev.toFixed(2)}</div>
             </div>
+            {voteHeatmap ? (
+              <div className="muted" style={{ marginBottom: 8, fontSize: 13 }}>
+                Vote tally: consensus pattern {voteHeatmap.winnerVotes}/{voteHeatmap.sampleCount} (runner-up{" "}
+                {voteHeatmap.secondVotes}). Skill-style moves — Keep Both: {voteHeatmap.keepBothSkillVotes},
+                Discard both: {voteHeatmap.discardSkillVotes}.
+              </div>
+            ) : null}
             <div className="muted" style={{ marginBottom: 8 }}>
               EV estimates expected total points on all completed rows and columns when the grid is full or
               no more full turns can be played; leftover deck cards are fine.
